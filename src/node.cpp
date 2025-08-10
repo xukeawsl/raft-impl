@@ -230,6 +230,7 @@ void Node::StartElection() {
 void Node::BecomeLeader() {
     SPDLOG_INFO("Node {} became leader for term {}", _node_id, _current_term);
     _state = State::LEADER;
+    _commit_index = 0;
 
     int64_t last_log_index = _store->GetLastLogIndex();
     for (const auto& peer : _peers) {
@@ -362,13 +363,6 @@ void Node::SaveLogEntry(int64_t index) {
     }
 }
 
-// 持久化已提交日志索引
-void Node::SaveCommitIndex() {
-    if (!_store->SaveCommitIndex(_commit_index)) {
-        SPDLOG_ERROR("Failed to save commit index");
-    }
-}
-
 // 删除从指定索引开始的日志条目
 void Node::DeleteLogEntriesFrom(int64_t from_index) {
     if (!_store->DeleteLogEntriesFrom(from_index)) {
@@ -380,12 +374,10 @@ void Node::DeleteLogEntriesFrom(int64_t from_index) {
 void Node::LoadPersistentState() {
     _current_term = _store->LoadCurrentTerm();
     _voted_for = _store->LoadVotedFor();
-    _commit_index = _store->LoadCommitIndex();
-    _last_applied = _commit_index;
 
     SPDLOG_INFO(
-        "Loaded persistent state: term={}, voted_for={}, commit_index={}",
-        _current_term, _voted_for, _commit_index);
+        "Loaded persistent state: term={}, voted_for={}",
+        _current_term, _voted_for);
 }
 
 // 确保指定peer已建立连接
@@ -617,7 +609,6 @@ void Node::HandleAppendEntriesResponse(
 
             if (count > static_cast<int64_t>(_peers.size() / 2)) {
                 _commit_index = i;
-                SaveCommitIndex();
             }
         }
     } else {    // 如果AppendEntries因为日志不一致而失败：递减NextIndex并重试
@@ -741,7 +732,7 @@ void Node::AppendEntries(google::protobuf::RpcController* cntl_base,
     if (request->leader_commit() > _commit_index) {
         _commit_index =
             std::min(request->leader_commit(), _store->GetLastLogIndex());
-        SaveCommitIndex();
+
         ApplyCommittedEntries();
     }
 

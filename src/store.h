@@ -27,15 +27,11 @@ public:
 
     bool SaveLogEntry(int64_t index, const raft::LogEntry& entry);
 
-    bool SaveCommitIndex(int64_t commit_index);
-
     bool DeleteLogEntriesFrom(int64_t from_index);
 
     int64_t LoadCurrentTerm();
 
     int64_t LoadVotedFor();
-
-    int64_t LoadCommitIndex();
 
     raft::LogEntry LoadLogEntry(int64_t index);
 
@@ -54,8 +50,8 @@ private:
     // RocksDB 键名
     const std::string kCurrentTermKey = "current_term";
     const std::string kVotedForKey = "voted_for";
-    const std::string kCommitIndexKey = "commit_index";
     const std::string kLogPrefix = "log:";
+
     const std::string kSnapshotMetadataKey = "snapshot_metadata";
     const std::string kSnapshotDataPrefix = "snapshot:";
 

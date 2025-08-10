@@ -25,6 +25,7 @@ namespace raft {
 class Node : public RaftService {
 public:
     Node(int64_t node_id, const std::vector<Peer>& peers);
+    
     ~Node();
 
     void RequestVote(google::protobuf::RpcController* cntl_base,
@@ -87,8 +88,6 @@ private:
     void SaveVotedFor();
 
     void SaveLogEntry(int64_t index);
-
-    void SaveCommitIndex();
 
     void DeleteLogEntriesFrom(int64_t from_index);
 

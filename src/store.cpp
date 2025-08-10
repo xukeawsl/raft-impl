@@ -53,13 +53,6 @@ bool Store::SaveVotedFor(int64_t voted_for) {
     return status.ok();
 }
 
-bool Store::SaveCommitIndex(int64_t commit_index) {
-    std::string value = std::to_string(commit_index);
-    rocksdb::Status status =
-        _db->Put(rocksdb::WriteOptions(), kCommitIndexKey, value);
-    return status.ok();
-}
-
 bool Store::SaveLogEntry(int64_t index, const raft::LogEntry& entry) {
     std::string key = GetLogIndexKey(index);
     std::string value;
@@ -107,20 +100,6 @@ int64_t Store::LoadVotedFor() {
     if (!status.ok()) {
         SPDLOG_ERROR("Failed to load voted for: {}", status.ToString());
         return -1;
-    }
-    return std::stoll(value);
-}
-
-int64_t Store::LoadCommitIndex() {
-    std::string value;
-    rocksdb::Status status =
-        _db->Get(rocksdb::ReadOptions(), kCommitIndexKey, &value);
-    if (status.IsNotFound()) {
-        return 0;
-    }
-    if (!status.ok()) {
-        SPDLOG_ERROR("Failed to load commit index: {}", status.ToString());
-        return 0;
     }
     return std::stoll(value);
 }
