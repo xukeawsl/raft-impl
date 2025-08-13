@@ -1,7 +1,9 @@
 #pragma once
 
+#include <memory>
 #include <string>
 
+#include "brpc/channel.h"
 #include "butil/endpoint.h"
 
 namespace raft {
@@ -9,6 +11,7 @@ namespace raft {
 struct Peer {
     butil::EndPoint addr;
     int64_t id;
+    std::shared_ptr<brpc::Channel> channel;
 
     Peer();
 
@@ -17,6 +20,8 @@ struct Peer {
     Peer(butil::EndPoint addr_, int64_t id_);
 
     Peer(const std::string& str);
+
+    bool init_channel();
 
     void reset();
 

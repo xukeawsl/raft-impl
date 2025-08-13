@@ -25,7 +25,7 @@ namespace raft {
 class Node : public RaftService {
 public:
     Node(int64_t node_id, const std::vector<Peer>& peers);
-    
+
     ~Node();
 
     void RequestVote(google::protobuf::RpcController* cntl_base,
@@ -97,12 +97,6 @@ private:
     // void CreateSnapshot(int64_t last_included_index);
     // void SendSnapshot(int64_t peer_id);
 
-    // 确保通道连接
-    bool EnsureChannelConnected(int64_t peer_id);
-
-    // 尝试重新连接所有节点
-    void TryReconnectPeers();
-
     void AsyncRequestVote(int64_t peer_id,
                           const raft::RequestVoteRequest& request,
                           RequestVoteCallback callback);
@@ -144,8 +138,8 @@ private:
     std::map<int64_t, int64_t> _match_index;
 
     // 节点信息
-    std::vector<Peer> _peers;
-    std::map<int64_t, PeerConnection> _peer_connections;
+    int64_t _peers_total_count;        // 包含自身
+    std::map<int64_t, Peer> _peers;    // 不包含自身
 
     // 心跳
     std::chrono::steady_clock::time_point _last_heartbeat_time;

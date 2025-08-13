@@ -14,6 +14,22 @@ Peer::Peer(const std::string& str) {
     }
 }
 
+bool Peer::init_channel() {
+    auto new_channel = std::make_shared<brpc::Channel>();
+
+    brpc::ChannelOptions options;
+    options.timeout_ms = 100;
+    options.max_retry = 1;
+
+    if (new_channel->Init(addr, &options) != 0) {
+        return false;
+    }
+
+    channel.swap(new_channel);
+
+    return true;
+}
+
 void Peer::reset() {
     addr.ip = butil::IP_ANY;
     addr.port = 0;

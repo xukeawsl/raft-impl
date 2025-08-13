@@ -16,9 +16,6 @@ DEFINE_int64(election_timeout_min, 150,
 DEFINE_int64(election_timeout_max, 300,
              "Maximum election timeout in milliseconds");
 DEFINE_int64(heartbeat_interval_ms, 50, "Heartbeat interval in milliseconds");
-DEFINE_int64(rpc_timeout_ms, 100, "RPC timeout in milliseconds");
-DEFINE_int64(reconnect_interval_ms, 5000,
-             "Peer reconnect interval in milliseconds");
 DEFINE_int64(snapshot_interval, 1000, "Log entries between snapshots");
 DEFINE_int64(snapshot_chunk_size, 1024 * 1024, "Snapshot chunk size in bytes");
 
@@ -31,19 +28,22 @@ Node::Node(int64_t node_id, const std::vector<Peer>& peers)
       _voted_for(-1),
       _commit_index(0),
       _last_applied(0),
-      _peers(peers),
       _last_heartbeat_time(std::chrono::steady_clock::now()),
       _rng(std::random_device{}()) {
-    auto self_it = std::find_if(
-        _peers.begin(), _peers.end(),
-        [node_id](const Peer& peer) { return peer.id == node_id; });
+    for (const auto& peer : peers) {
+        if (peer.id == node_id) {
+            _self_address = peer.address();
+            continue;
+        }
+        _peers[peer.id] = peer;
+    }
 
-    if (self_it == _peers.end()) {
+    _peers_total_count = _peers.size() + 1;
+
+    if (_self_address.empty()) {
         SPDLOG_ERROR("Current node ID {} not found in peers", node_id);
         throw std::runtime_error("Invalid node configuration");
     }
-
-    _self_address = self_it->address();
 
     std::string db_path = "./raft_meta/node_" + std::to_string(node_id);
     if (!butil::CreateDirectory(butil::FilePath(db_path))) {
@@ -58,17 +58,12 @@ Node::Node(int64_t node_id, const std::vector<Peer>& peers)
 
     LoadPersistentState();
 
-    for (const auto& peer : _peers) {
-        if (peer.id == node_id) continue;
-
-        PeerConnection conn;
-        conn.peer = peer;
-        conn.channel = std::make_unique<brpc::Channel>();
-        conn.connected = false;
-        conn.last_attempt_time =
-            std::chrono::steady_clock::now() -
-            std::chrono::milliseconds(FLAGS_reconnect_interval_ms + 1000);
-        _peer_connections[peer.id] = std::move(conn);
+    for (auto& [peer_id, peer] : _peers) {
+        SPDLOG_INFO("Added peer: {}", _peers[peer.id].to_string());
+        if (!peer.init_channel()) {
+            throw std::runtime_error("Failed to initialize channel for peer: " +
+                                     peer.address());
+        }
     }
 
     ResetElectionTimer();
@@ -103,23 +98,10 @@ void Node::Stop() {
 }
 
 void Node::RunLoop() {
-    auto last_reconnect_time = std::chrono::steady_clock::now();
-    // auto last_snapshot_check = last_reconnect_time;
-
     while (_running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
         BAIDU_SCOPED_LOCK(_mutex);
-
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                           now - _last_reset_time)
-                           .count();
-
-        if (elapsed >= FLAGS_reconnect_interval_ms) {
-            TryReconnectPeers();
-            last_reconnect_time = now;
-        }
 
         switch (_state) {
             case State::LEADER:
@@ -192,7 +174,7 @@ void Node::StartElection() {
     ResetElectionTimer();    // 重置选举定时器
 
     // 如果集群就一个节点, 直接成为主即可
-    if (_votes_received > static_cast<int64_t>(_peers.size() / 2)) {
+    if (_votes_received > static_cast<int64_t>(_peers_total_count / 2)) {
         BecomeLeader();
         return;
     }
@@ -207,14 +189,7 @@ void Node::StartElection() {
     request.set_last_log_term(last_stored_term);
 
     // 向所有其他服务器发送异步 RequestVote RPCs
-    for (auto& [peer_id, conn] : _peer_connections) {
-        bool connected = EnsureChannelConnected(peer_id);
-
-        if (!connected) {
-            SPDLOG_WARN("Skipping peer {} - not connected", peer_id);
-            continue;
-        }
-
+    for (auto& [peer_id, _] : _peers) {
         AsyncRequestVote(
             peer_id, request,
             [this, request](int64_t peer_id,
@@ -233,10 +208,9 @@ void Node::BecomeLeader() {
     _commit_index = 0;
 
     int64_t last_log_index = _store->GetLastLogIndex();
-    for (const auto& peer : _peers) {
-        if (peer.id == _node_id) continue;
-        _next_index[peer.id] = last_log_index + 1;
-        _match_index[peer.id] = 0;
+    for (const auto& [peer_id, _] : _peers) {
+        _next_index[peer_id] = last_log_index + 1;
+        _match_index[peer_id] = 0;
     }
 
     BroadcastHeartbeat();
@@ -244,7 +218,7 @@ void Node::BecomeLeader() {
 
 // 发送心跳请求，也用于成为Leader后发起日志复制
 void Node::BroadcastHeartbeat() {
-    for (auto& [peer_id, conn] : _peer_connections) {
+    for (auto& [peer_id, _] : _peers) {
         ReplicateLog(peer_id);
     }
 
@@ -254,12 +228,6 @@ void Node::BroadcastHeartbeat() {
 // 发起日志复制
 void Node::ReplicateLog(int64_t peer_id) {
     if (_state != State::LEADER) {
-        return;
-    }
-
-    if (!EnsureChannelConnected(peer_id)) {
-        SPDLOG_WARN("Skipping log replication to peer {} - not connected",
-                    peer_id);
         return;
     }
 
@@ -375,78 +343,14 @@ void Node::LoadPersistentState() {
     _current_term = _store->LoadCurrentTerm();
     _voted_for = _store->LoadVotedFor();
 
-    SPDLOG_INFO(
-        "Loaded persistent state: term={}, voted_for={}",
-        _current_term, _voted_for);
-}
-
-// 确保指定peer已建立连接
-bool Node::EnsureChannelConnected(int64_t peer_id) {
-    auto it = _peer_connections.find(peer_id);
-    if (it == _peer_connections.end()) {
-        SPDLOG_WARN("Peer {} not found", peer_id);
-    }
-
-    PeerConnection& conn = it->second;
-
-    if (conn.connected) {
-        return true;
-    }
-
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                       now - conn.last_attempt_time)
-                       .count();
-
-    if (elapsed < FLAGS_reconnect_interval_ms) {
-        return false;
-    }
-
-    conn.last_attempt_time = now;
-
-    brpc::ChannelOptions options;
-    options.timeout_ms = FLAGS_rpc_timeout_ms;
-    options.max_retry = 1;
-    options.connect_timeout_ms = 500;
-
-    if (conn.channel->Init(conn.peer.addr, &options) != 0) {
-        SPDLOG_WARN("Failed to connect to peer {} at {}", peer_id,
-                    conn.peer.to_string());
-        conn.connected = false;
-        return false;
-    }
-
-    SPDLOG_INFO("Successfully connected to peer {} at {}", peer_id,
-                conn.peer.to_string());
-    conn.connected = true;
-
-    return true;
-}
-
-// 尝试连接所有peer节点
-void Node::TryReconnectPeers() {
-    for (auto& [peer_id, connect] : _peer_connections) {
-        EnsureChannelConnected(peer_id);
-    }
+    SPDLOG_INFO("Loaded persistent state: term={}, voted_for={}", _current_term,
+                _voted_for);
 }
 
 // 异步发起投票请求
 void Node::AsyncRequestVote(int64_t peer_id,
                             const raft::RequestVoteRequest& request,
                             RequestVoteCallback callback) {
-    auto it = _peer_connections.find(peer_id);
-    if (it == _peer_connections.end()) {
-        SPDLOG_WARN("Peer {} not found", peer_id);
-        return;
-    }
-
-    PeerConnection& conn = it->second;
-
-    if (!conn.connected) {
-        SPDLOG_WARN("Peer {} is not connected", peer_id);
-        return;
-    }
-
     auto* cntl = new brpc::Controller();
     auto* response = new raft::RequestVoteResponse();
 
@@ -471,7 +375,7 @@ void Node::AsyncRequestVote(int64_t peer_id,
     google::protobuf::Closure* done =
         brpc::NewCallback(&RequestVoteCallbackWrapper::Invoke, wrapper);
 
-    RaftService_Stub stub(conn.channel.get());
+    RaftService_Stub stub(_peers[peer_id].channel.get());
     stub.RequestVote(cntl, &request, response, done);
 }
 
@@ -479,19 +383,6 @@ void Node::AsyncRequestVote(int64_t peer_id,
 void Node::AsyncAppendEntries(int64_t peer_id,
                               const raft::AppendEntriesRequest& request,
                               AppendEntriesCallback callback) {
-    auto it = _peer_connections.find(peer_id);
-    if (it == _peer_connections.end()) {
-        SPDLOG_WARN("Peer {} not found", peer_id);
-        return;
-    }
-
-    PeerConnection& conn = it->second;
-
-    if (!conn.connected) {
-        SPDLOG_WARN("Peer {} is not connected", peer_id);
-        return;
-    }
-
     auto* cntl = new brpc::Controller();
     auto* response = new raft::AppendEntriesResponse();
 
@@ -516,7 +407,7 @@ void Node::AsyncAppendEntries(int64_t peer_id,
     google::protobuf::Closure* done =
         brpc::NewCallback(&AppendEntriesCallbackWrapper::Invoke, wrapper);
 
-    RaftService_Stub stub(conn.channel.get());
+    RaftService_Stub stub(_peers[peer_id].channel.get());
     stub.AppendEntries(cntl, &request, response, done);
 }
 
@@ -550,7 +441,7 @@ void Node::HandleRequestVoteResponse(int64_t peer_id,
         ++_votes_received;
 
         // 如果获得大多数服务器的投票：成为领导者
-        if (_votes_received > static_cast<int64_t>(_peers.size() / 2)) {
+        if (_votes_received > static_cast<int64_t>(_peers_total_count / 2)) {
             SPDLOG_INFO("Node {} became leader", _node_id);
             BecomeLeader();
         }
@@ -607,7 +498,7 @@ void Node::HandleAppendEntriesResponse(
                 if (match >= i) ++count;
             }
 
-            if (count > static_cast<int64_t>(_peers.size() / 2)) {
+            if (count > static_cast<int64_t>(_peers_total_count / 2)) {
                 _commit_index = i;
             }
         }
@@ -756,7 +647,7 @@ bool Node::SubmitCommand(const std::string& command) {
         return false;
     }
 
-    for (auto& [peer_id, _] : _peer_connections) {
+    for (auto& [peer_id, _] : _peers) {
         if (_next_index[peer_id] == new_index) {
             ++_next_index[peer_id];
         }
