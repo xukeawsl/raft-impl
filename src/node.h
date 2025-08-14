@@ -75,6 +75,8 @@ private:
 
     void BecomeLeader();
 
+    void LeaderSubmitNoOpCommand();
+
     void BroadcastHeartbeat();
 
     void ReplicateLog(int64_t peer_id);

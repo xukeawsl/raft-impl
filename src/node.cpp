@@ -205,15 +205,41 @@ void Node::StartElection() {
 void Node::BecomeLeader() {
     SPDLOG_INFO("Node {} became leader for term {}", _node_id, _current_term);
     _state = State::LEADER;
-    _commit_index = 0;
 
+    // 默认要同步的下一个条目的索引为最后一条目录索引+1
+    // 已知的已经匹配的索引应该为0
     int64_t last_log_index = _store->GetLastLogIndex();
     for (const auto& [peer_id, _] : _peers) {
         _next_index[peer_id] = last_log_index + 1;
         _match_index[peer_id] = 0;
     }
 
-    BroadcastHeartbeat();
+    LeaderSubmitNoOpCommand();
+}
+
+// 成为 Leader 之后要立即发一条带当前任期的日志条目
+// 这样才可以把 commit_index 更新到最新的值
+// 但是 last_applied 只能从 0 开始重新执行状态机了
+// 所以需要保证状态机执行时幂等的，有两种方案
+// 1. raft 协议实现保证幂等，通过添加请求 ID 来实现，执行过的直接跳过
+// 2. 状态机内部实现幂等性，也可以采用类似的方法
+// 最后为了加快恢复速度，可以引入快照来压缩日志
+void Node::LeaderSubmitNoOpCommand() {
+    LogEntry entry;
+    entry.set_term(_current_term);
+
+    int64_t new_index = _store->GetLastLogIndex() + 1;
+    if (!_store->SaveLogEntry(new_index, entry)) {
+        SPDLOG_ERROR("Failed to save log entry");
+        return;
+    }
+
+    for (auto& [peer_id, _] : _peers) {
+        if (_next_index[peer_id] == new_index) {
+            ++_next_index[peer_id];
+        }
+        ReplicateLog(peer_id);
+    }
 }
 
 // 发送心跳请求，也用于成为Leader后发起日志复制
@@ -237,7 +263,7 @@ void Node::ReplicateLog(int64_t peer_id) {
 
     int64_t next_idx = _next_index[peer_id];
     int64_t prev_log_index = next_idx - 1;
-    int64_t prev_log_term = 0;
+    int64_t prev_log_term = 0;    // 历史如果不存在日志, 则对应任期为0
     int64_t last_stored_index = _store->GetLastLogIndex();
 
     if (prev_log_index > 0) {
@@ -480,32 +506,40 @@ void Node::HandleAppendEntriesResponse(
     SPDLOG_TRACE("AppendEntries response from peer {}: success={}, term={}",
                  peer_id, response.success(), response.term());
 
-    if (response.success()) {    // 如果成功：为跟随者更新nextIndex和matchIndex
+    if (response.success()) {
+        // 如果成功：为跟随者更新nextIndex和matchIndex
+        // 下面取 max 是因为在异步回调的过程中可能会有新的日志被追加
         int64_t next_idx =
             request.prev_log_index() + request.entries_size() + 1;
-        _next_index[peer_id] = next_idx;
-        _match_index[peer_id] = next_idx - 1;
-
-        // 如果存在一个N，使得N>commitIndex，大多数的matchIndex[i]≥N
-        // 并且log[N].term == currentTerm：设置commitIndex = N
-        for (int64_t i = _commit_index + 1; i <= _store->GetLastLogIndex();
-             ++i) {
-            auto entry = _store->LoadLogEntry(i);
-            if (entry.term() != _current_term) continue;
-
-            int64_t count = 1;
-            for (auto& [id, match] : _match_index) {
-                if (match >= i) ++count;
-            }
-
-            if (count > static_cast<int64_t>(_peers_total_count / 2)) {
-                _commit_index = i;
-            }
-        }
+        _next_index[peer_id] = std::max(_next_index[peer_id], next_idx);
+        _match_index[peer_id] = std::max(_match_index[peer_id], next_idx - 1);
     } else {    // 如果AppendEntries因为日志不一致而失败：递减NextIndex并重试
         if (_next_index[peer_id] > 1) {
             --_next_index[peer_id];
         }
+    }
+
+    // 如果存在一个N，使得N>commitIndex，大多数的matchIndex[i]≥N
+    // 并且log[N].term == currentTerm：设置commitIndex = N
+    int64_t last_stored_index = _store->GetLastLogIndex();
+    int64_t old_commit_index = _commit_index;
+    for (int64_t i = _commit_index + 1; i <= last_stored_index; ++i) {
+        auto entry = _store->LoadLogEntry(i);
+        if (entry.term() != _current_term) continue;
+
+        int64_t count = 1;
+        for (auto& [_, match] : _match_index) {
+            if (match >= i) ++count;
+        }
+
+        if (count > static_cast<int64_t>(_peers_total_count / 2)) {
+            _commit_index = i;
+        }
+    }
+
+    if (old_commit_index != _commit_index) {
+        SPDLOG_INFO("Node {} updated commitIndex: {} -> {}", _node_id,
+                    old_commit_index, _commit_index);
     }
 }
 
