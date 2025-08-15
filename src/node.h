@@ -73,6 +73,8 @@ private:
 
     void StartElection();
 
+    void StepDown(int64_t term);
+
     void BecomeLeader();
 
     void LeaderSubmitNoOpCommand();

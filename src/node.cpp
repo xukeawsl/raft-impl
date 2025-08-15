@@ -201,6 +201,20 @@ void Node::StartElection() {
     }
 }
 
+// 如果RPC请求或响应包含任期 T > currentTerm
+// 设置currentTerm = T，转换为follower
+void Node::StepDown(int64_t term) {
+    _current_term = term;
+    _state = State::FOLLOWER;
+    _voted_for = -1;
+
+    SaveCurrentTerm();
+    SaveVotedFor();
+
+    ResetElectionTimer();
+    return;
+}
+
 // 成为Leader，更新状态并初始化日志复制
 void Node::BecomeLeader() {
     SPDLOG_INFO("Node {} became leader for term {}", _node_id, _current_term);
@@ -454,12 +468,7 @@ void Node::HandleRequestVoteResponse(int64_t peer_id,
     }
 
     if (response.term() > _current_term) {
-        _current_term = response.term();
-        _state = State::FOLLOWER;
-        _voted_for = -1;
-        ResetElectionTimer();
-        SaveCurrentTerm();
-        SaveVotedFor();
+        StepDown(request.term());
         return;
     }
 
@@ -490,16 +499,7 @@ void Node::HandleAppendEntriesResponse(
     }
 
     if (response.term() > _current_term) {
-        SPDLOG_INFO(
-            "Node {} stepping down from leader to follower due to higher term "
-            "from peer {}",
-            _node_id, peer_id);
-        _current_term = response.term();
-        _state = State::FOLLOWER;
-        _voted_for = -1;
-        ResetElectionTimer();
-        SaveCurrentTerm();
-        SaveVotedFor();
+        StepDown(request.term());
         return;
     }
 
@@ -560,17 +560,11 @@ void Node::RequestVote(google::protobuf::RpcController* cntl_base,
         return;
     }
 
-    // 如果RPC请求或响应包含任期 T > currentTerm：设置currentTerm =
-    // T，转换为follower
     if (request->term() > _current_term) {
-        _current_term = request->term();
-        _state = State::FOLLOWER;
-        _voted_for = -1;
-        SaveCurrentTerm();
-        SaveVotedFor();
+        StepDown(request->term());
     }
 
-    SPDLOG_INFO(
+    SPDLOG_TRACE(
         "Node {} received RequestVote from {}: term={}, last_log_index={}, "
         "last_log_term={}",
         _node_id, request->candidate_id(), request->term(),
@@ -605,14 +599,8 @@ void Node::AppendEntries(google::protobuf::RpcController* cntl_base,
 
     ResetElectionTimer();
 
-    // 如果RPC请求或响应包含任期 T > currentTerm：设置currentTerm =
-    // T，转换为follower
     if (request->term() > _current_term || _state != State::FOLLOWER) {
-        _current_term = request->term();
-        _state = State::FOLLOWER;
-        _voted_for = -1;
-        SaveCurrentTerm();
-        SaveVotedFor();
+        StepDown(request->term());
     }
 
     // 大于 0 说明是携带日志的
