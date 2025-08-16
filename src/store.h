@@ -17,8 +17,6 @@ public:
 
     ~Store();
 
-    std::string GetLogIndexKey(int64_t index);
-
     bool Open();
 
     bool SaveCurrentTerm(int64_t term);
@@ -26,6 +24,12 @@ public:
     bool SaveVotedFor(int64_t voted_for);
 
     bool SaveLogEntry(int64_t index, const raft::LogEntry& entry);
+
+    int64_t GetLastLogIndex();
+
+    bool DeleteLogEntriesRange(int64_t start_index, int64_t end_index);
+
+    bool DeleteLogEntriesBefore(int64_t index);
 
     bool DeleteLogEntriesFrom(int64_t from_index);
 
@@ -37,24 +41,17 @@ public:
 
     std::vector<raft::LogEntry> LoadLogEntries();
 
-    int64_t GetLastLogIndex();
+    bool SaveSnapshotMetaData(const raft::SnapshotMetaData& meta);
 
-    // 快照管理
-    //   bool SaveSnapshotMetadata(const raft::SnapshotMetadata& metadata);
-    //   raft::SnapshotMetadata LoadSnapshotMetadata();
-    bool SaveSnapshotChunk(int64_t offset, const std::string& data);
-
-    std::string LoadSnapshotChunk(int64_t offset, size_t size);
+    raft::SnapshotMetaData LoadSnapshotMetaData();
 
 private:
-    // RocksDB 键名
+    std::string GetLogIndexKey(int64_t index);
+
     const std::string kCurrentTermKey = "current_term";
     const std::string kVotedForKey = "voted_for";
     const std::string kLogPrefix = "log:";
-
-    const std::string kSnapshotMetadataKey = "snapshot_metadata";
-    const std::string kSnapshotDataPrefix = "snapshot:";
-
+    const std::string kSnapShotMetaData = "snapshot_meta_data";
     const int32_t kLogIndexWidth = 20;
 
     std::string _db_path;

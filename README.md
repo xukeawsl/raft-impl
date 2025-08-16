@@ -1,6 +1,9 @@
 # raft-impl
 
-基于 brpc 和 rocksdb 实现 raft 共识算法，目前只实现了 Leader 选举和日志复制，后续会实现快照
+基于 brpc 和 rocksdb 实现 raft 共识算法，实现如下功能
+* 领导者选举
+* 日志复制
+* 快照安装（不支持多分块）
 
 ## 依赖
 

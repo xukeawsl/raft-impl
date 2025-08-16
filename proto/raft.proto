@@ -5,37 +5,56 @@ package raft;
 option cc_generic_services = true;
 
 message LogEntry {
-    optional int64 term = 1;
-    optional bytes command = 2;
-}
-
-message RequestVoteRequest {
-    optional int64 term = 1;
-    optional int64 candidate_id = 2;
-    optional int64 last_log_index = 3;
-    optional int64 last_log_term = 4;
-}
-
-message RequestVoteResponse {
-    optional int64 term = 1;
-    optional bool vote_granted = 2;
+    required int64 term = 1;                // 日志条目的任期
+    optional bytes command = 2;             // 客户端提交的命令，用于状态机执行
 }
 
 message AppendEntriesRequest {
-    optional int64 term = 1;
-    optional int64 leader_id = 2;
-    optional int64 prev_log_index = 3;
-    optional int64 prev_log_term = 4;
-    repeated LogEntry entries = 5;
-    optional int64 leader_commit = 6;
+    required int64 term = 1;                // 领导人的任期
+    required int64 leader_id = 2;           // 领导人 ID 因此跟随者可以对客户端进行重定向
+    required int64 prev_log_index = 3;      // 紧邻新日志条目之前的那个日志条目的索引
+    required int64 prev_log_term = 4;       // 紧邻新日志条目之前的那个日志条目的任期
+    repeated LogEntry entries = 5;          // 需要被保存的日志条目（被当做心跳使用时，则日志条目内容为空；为了提高效率可能一次性发送多个）
+    required int64 leader_commit = 6;       // 领导人的已知已提交的最高的日志条目的索引
 }
 
 message AppendEntriesResponse {
-    optional int64 term = 1;
-    optional bool success = 2;
+    required int64 term = 1;                // 当前任期，对于领导人而言 它会更新自己的任期
+    required bool success = 2;              // 如果跟随者所含有的条目和 prevLogIndex 以及 prevLogTerm 匹配上了，则为 true
+}
+
+message RequestVoteRequest {
+    required int64 term = 1;                // 候选人的任期号
+    required int64 candidate_id = 2;        // 请求选票的候选人的 ID
+    required int64 last_log_index = 3;      // 候选人的最后日志条目的索引值
+    required int64 last_log_term = 4;       // 候选人最后日志条目的任期号
+}
+
+message RequestVoteResponse {
+    required int64 term = 1;                // 当前任期号，以便于候选人去更新自己的任期号
+    required bool vote_granted = 2;         // 候选人赢得了此张选票时为真
+}
+
+message SnapshotMetaData {
+    required int64 last_included_index = 1; // 快照中包含的最后日志条目的索引值
+    required int64 last_included_term = 2;  // 快照中包含的最后日志条目的任期号
+    required bytes data = 3;                // 状态机的快照数据，理论是偏移量开始后的数据，但是由于只实现单分块，这里就一起放到元数据里面方便持久化了
+}
+
+message InstallSnapshotRequest {
+    required int64 term = 1;                // 领导人的任期号
+    required int64 leader_id = 2;           // 领导人的 ID，以便于跟随者重定向请求
+    required SnapshotMetaData meta = 3;     // 快照元数据
+    required int64 offset = 4;              // 分块在快照中的字节偏移量
+    required bool done = 5;                 // 如果这是最后一个分块则为 true
+}
+
+message InstallSnapshotResponse {
+    required int64 term = 1;                // 当前任期号（currentTerm），便于领导人更新自己
 }
 
 service RaftService {
     rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
     rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+    rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
 }

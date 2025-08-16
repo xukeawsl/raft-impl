@@ -38,6 +38,11 @@ public:
                        raft::AppendEntriesResponse* response,
                        google::protobuf::Closure* done) override;
 
+    void InstallSnapshot(google::protobuf::RpcController* cntl_base,
+                         const raft::InstallSnapshotRequest* request,
+                         raft::InstallSnapshotResponse* response,
+                         google::protobuf::Closure* done) override;
+
     void Start();
 
     void Stop();
@@ -45,13 +50,6 @@ public:
     bool SubmitCommand(const std::string& command);
 
 private:
-    struct PeerConnection {
-        Peer peer;
-        std::unique_ptr<brpc::Channel> channel;
-        std::chrono::steady_clock::time_point last_attempt_time;
-        bool connected;
-    };
-
     enum class State { FOLLOWER, CANDIDATE, LEADER };
 
     using RequestVoteCallback =
@@ -60,8 +58,8 @@ private:
     using AppendEntriesCallback =
         std::function<void(int64_t, const raft::AppendEntriesResponse&, bool)>;
 
-    // using InstallSnapshotCallback = std::function<void(int64_t, const
-    // raft::InstallSnapshotResponse&, bool)>;
+    using InstallSnapshotCallback = std::function<void(
+        int64_t, const raft::InstallSnapshotResponse&, bool)>;
 
     void RunLoop();
 
@@ -70,6 +68,8 @@ private:
     void ResetElectionTimer();
 
     bool IsElectionTimeout() const;
+
+    void MakeSnapshot();
 
     void StartElection();
 
@@ -85,7 +85,7 @@ private:
 
     void ApplyCommittedEntries();
 
-    bool IsLogUpToDate(int64_t last_log_term, int64_t last_log_index) const;
+    bool IsLogUpToDate(int64_t last_log_term, int64_t last_log_index);
 
     void SaveCurrentTerm();
 
@@ -93,13 +93,21 @@ private:
 
     void SaveLogEntry(int64_t index);
 
+    int64_t GetLastLogIndex();
+
+    int64_t GetLastLogTerm();
+
+    int64_t GetLogTerm(int64_t index);
+
+    void DeleteLogEntriesBefore(int64_t index);
+
     void DeleteLogEntriesFrom(int64_t from_index);
 
     void LoadPersistentState();
 
-    // 快照管理
-    // void CreateSnapshot(int64_t last_included_index);
-    // void SendSnapshot(int64_t peer_id);
+    void CreateSnapshot(int64_t last_included_index);
+
+    void SendSnapshot(int64_t peer_id);
 
     void AsyncRequestVote(int64_t peer_id,
                           const raft::RequestVoteRequest& request,
@@ -108,9 +116,10 @@ private:
     void AsyncAppendEntries(int64_t peer_id,
                             const raft::AppendEntriesRequest& request,
                             AppendEntriesCallback callback);
-    //   void AsyncInstallSnapshot(int64_t peer_id, const
-    //   raft::InstallSnapshotRequest& request,
-    //                             InstallSnapshotCallback callback);
+
+    void AsyncInstallSnapshot(int64_t peer_id,
+                              const raft::InstallSnapshotRequest& request,
+                              InstallSnapshotCallback callback);
 
     void HandleRequestVoteResponse(int64_t peer_id,
                                    const raft::RequestVoteRequest& request,
@@ -121,10 +130,9 @@ private:
         int64_t peer_id, const raft::AppendEntriesRequest& request,
         const raft::AppendEntriesResponse& response, bool failed);
 
-    //   void HandleInstallSnapshotResponse(int64_t peer_id, const
-    //   raft::InstallSnapshotRequest& request,
-    //                                      const raft::InstallSnapshotResponse&
-    //                                      response, bool failed);
+    void HandleInstallSnapshotResponse(
+        int64_t peer_id, const raft::InstallSnapshotRequest& request,
+        const raft::InstallSnapshotResponse& response, bool failed);
 
     const int64_t _node_id;
     std::string _self_address;
@@ -165,8 +173,10 @@ private:
     brpc::Server _server;
 
     // 快照状态
-    // int64_t _snapshot_last_index{0};
-    // int64_t _snapshot_last_term{0};
+    int64_t _snapshot_last_index{0};
+    int64_t _snapshot_last_term{0};
+    std::chrono::steady_clock::time_point _last_snapshot_time;
+    std::unordered_map<int64_t, bool> _snapshoting_peers;
 };
 
 }    // namespace raft

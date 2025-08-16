@@ -5,7 +5,6 @@
 namespace raft {
 
 Store::Store(const std::string& db_path) : _db_path(db_path), _db(nullptr) {
-    // 配置 RocksDB 选项
     _options.create_if_missing = true;
     _options.create_missing_column_families = true;
     _options.max_open_files = 100;
@@ -64,9 +63,9 @@ bool Store::SaveLogEntry(int64_t index, const raft::LogEntry& entry) {
     return status.ok();
 }
 
-bool Store::DeleteLogEntriesFrom(int64_t from_index) {
-    std::string start_key = GetLogIndexKey(from_index);
-    std::string end_key = GetLogIndexKey(INT64_MAX);
+bool Store::DeleteLogEntriesRange(int64_t start_index, int64_t end_index) {
+    std::string start_key = GetLogIndexKey(start_index);
+    std::string end_key = GetLogIndexKey(end_index);
 
     rocksdb::Slice start(start_key);
     rocksdb::Slice end(end_key);
@@ -74,6 +73,14 @@ bool Store::DeleteLogEntriesFrom(int64_t from_index) {
     rocksdb::Status status = _db->DeleteRange(
         rocksdb::WriteOptions(), _db->DefaultColumnFamily(), start, end);
     return status.ok();
+}
+
+bool Store::DeleteLogEntriesBefore(int64_t index) {
+    return DeleteLogEntriesRange(0, index);
+}
+
+bool Store::DeleteLogEntriesFrom(int64_t from_index) {
+    return DeleteLogEntriesRange(from_index, INT64_MAX);
 }
 
 int64_t Store::LoadCurrentTerm() {
@@ -114,6 +121,8 @@ raft::LogEntry Store::LoadLogEntry(int64_t index) {
         if (!entry.ParseFromString(value)) {
             SPDLOG_ERROR("Failed to parse log entry at index {}", index);
         }
+    } else {
+        SPDLOG_ERROR("Not found log entry at index {}", index);
     }
     return entry;
 }
@@ -168,56 +177,29 @@ int64_t Store::GetLastLogIndex() {
     return last_index;
 }
 
-// bool Store::SaveSnapshotMetadata(const raft::SnapshotMetadata& metadata) {
-//   std::string value;
-//   if (!metadata.SerializeToString(&value)) {
-//     SPDLOG_ERROR("Failed to serialize snapshot metadata");
-//     return false;
-//   }
-//   rocksdb::Status status = _db->Put(rocksdb::WriteOptions(),
-//   kSnapshotMetadataKey, value); return status.ok();
-// }
-
-// raft::SnapshotMetadata Store::LoadSnapshotMetadata() {
-//   std::string value;
-//   rocksdb::Status status = _db->Get(rocksdb::ReadOptions(),
-//   kSnapshotMetadataKey, &value);
-
-//     return false;
-//   }
-//   rocksdb::Status status = _db->Put(rocksdb::WriteOptions(),
-//   kSnapshotMetadataKey, value); return status.ok();
-// }
-
-// raft::SnapshotMetadata Store::LoadSnapshotMetadata() {
-//   std::string value;
-//   rocksdb::Status status = _db->Get(rocksdb::ReadOptions(),
-//   kSnapshotMetadataKey, &value);
-
-//   raft::SnapshotMetadata metadata;
-//   if (status.ok()) {
-//     if (!metadata.ParseFromString(value)) {
-//       LOG(ERROR) << "Failed to parse snapshot metadata";
-//     }
-//   }
-//   return metadata;
-// }
-
-bool Store::SaveSnapshotChunk(int64_t offset, const std::string& data) {
-    std::string key = kSnapshotDataPrefix + std::to_string(offset);
-    rocksdb::Status status = _db->Put(rocksdb::WriteOptions(), key, data);
+bool Store::SaveSnapshotMetaData(const raft::SnapshotMetaData& meta) {
+    std::string value;
+    if (!meta.SerializeToString(&value)) {
+        SPDLOG_ERROR("Failed to serialize snapshot meta data");
+        return false;
+    }
+    rocksdb::Status status =
+        _db->Put(rocksdb::WriteOptions(), kSnapShotMetaData, value);
     return status.ok();
 }
 
-std::string Store::LoadSnapshotChunk(int64_t offset, size_t size) {
-    std::string key = kSnapshotDataPrefix + std::to_string(offset);
+raft::SnapshotMetaData Store::LoadSnapshotMetaData() {
     std::string value;
-    rocksdb::Status status = _db->Get(rocksdb::ReadOptions(), key, &value);
+    rocksdb::Status status =
+        _db->Get(rocksdb::ReadOptions(), kSnapShotMetaData, &value);
 
-    if (status.ok() && value.size() == size) {
-        return value;
+    raft::SnapshotMetaData meta;
+    if (status.ok()) {
+        if (!meta.ParseFromString(value)) {
+            SPDLOG_ERROR("Failed to parse snapshot meta data");
+        }
     }
-    return "";
+    return meta;
 }
 
 }    // namespace raft

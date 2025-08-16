@@ -16,8 +16,9 @@ DEFINE_int64(election_timeout_min, 150,
 DEFINE_int64(election_timeout_max, 300,
              "Maximum election timeout in milliseconds");
 DEFINE_int64(heartbeat_interval_ms, 50, "Heartbeat interval in milliseconds");
-DEFINE_int64(snapshot_interval, 1000, "Log entries between snapshots");
-DEFINE_int64(snapshot_chunk_size, 1024 * 1024, "Snapshot chunk size in bytes");
+DEFINE_int64(snapshot_check_interval_ms, 5000,
+             "Snapshot check interval in milliseconds");
+DEFINE_int64(snapshot_interval, 5, "Log entries between snapshots");
 
 namespace raft {
 
@@ -29,13 +30,15 @@ Node::Node(int64_t node_id, const std::vector<Peer>& peers)
       _commit_index(0),
       _last_applied(0),
       _last_heartbeat_time(std::chrono::steady_clock::now()),
-      _rng(std::random_device{}()) {
+      _rng(std::random_device{}()),
+      _last_snapshot_time(std::chrono::steady_clock::now()) {
     for (const auto& peer : peers) {
         if (peer.id == node_id) {
             _self_address = peer.address();
             continue;
         }
         _peers[peer.id] = peer;
+        _snapshoting_peers[peer.id] = false;
     }
 
     _peers_total_count = _peers.size() + 1;
@@ -103,15 +106,18 @@ void Node::RunLoop() {
 
         BAIDU_SCOPED_LOCK(_mutex);
 
+        // 每个服务器都独立的创建快照
+        MakeSnapshot();
+
         switch (_state) {
-            case State::LEADER:
+            case State::LEADER: {
                 // 向每个服务器发送初始的空AppendEntries
                 // RPC（心跳）；在空闲期间重复，以防止选举超时
                 if (IsHeartbeatTimeout()) {
                     BroadcastHeartbeat();
                 }
-                break;
-            case State::CANDIDATE:
+            } break;
+            case State::CANDIDATE: {
                 if (IsElectionTimeout()) {
                     SPDLOG_TRACE(
                         "Node {} election timeout in candidate state, "
@@ -119,8 +125,8 @@ void Node::RunLoop() {
                         _node_id);
                     StartElection();
                 }
-                break;
-            case State::FOLLOWER:
+            } break;
+            case State::FOLLOWER: {
                 // 如果选举超时，没有收到现任Leader的AppendEntries
                 // RPC，也没有给Candidate投票：转换为Candidate
                 if (IsElectionTimeout()) {
@@ -128,7 +134,7 @@ void Node::RunLoop() {
                                  _node_id);
                     StartElection();
                 }
-                break;
+            } break;
         }
 
         ApplyCommittedEntries();
@@ -161,6 +167,19 @@ bool Node::IsElectionTimeout() const {
     return elapsed > _election_timeout_ms;
 }
 
+void Node::MakeSnapshot() {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       now - _last_snapshot_time)
+                       .count();
+    if (elapsed > FLAGS_snapshot_check_interval_ms) {
+        if (_last_applied - _snapshot_last_index > FLAGS_snapshot_interval) {
+            CreateSnapshot(_last_applied);
+        }
+        _last_snapshot_time = now;
+    }
+}
+
 // 启动选举流程
 void Node::StartElection() {
     _state = State::CANDIDATE;    // 转换为候选人状态
@@ -179,8 +198,8 @@ void Node::StartElection() {
         return;
     }
 
-    int64_t last_stored_index = _store->GetLastLogIndex();
-    int64_t last_stored_term = _store->LoadLogEntry(last_stored_index).term();
+    int64_t last_stored_index = GetLastLogIndex();
+    int64_t last_stored_term = GetLastLogTerm();
 
     raft::RequestVoteRequest request;
     request.set_term(_current_term);
@@ -222,7 +241,7 @@ void Node::BecomeLeader() {
 
     // 默认要同步的下一个条目的索引为最后一条目录索引+1
     // 已知的已经匹配的索引应该为0
-    int64_t last_log_index = _store->GetLastLogIndex();
+    int64_t last_log_index = GetLastLogIndex();
     for (const auto& [peer_id, _] : _peers) {
         _next_index[peer_id] = last_log_index + 1;
         _match_index[peer_id] = 0;
@@ -242,7 +261,7 @@ void Node::LeaderSubmitNoOpCommand() {
     LogEntry entry;
     entry.set_term(_current_term);
 
-    int64_t new_index = _store->GetLastLogIndex() + 1;
+    int64_t new_index = GetLastLogIndex() + 1;
     if (!_store->SaveLogEntry(new_index, entry)) {
         SPDLOG_ERROR("Failed to save log entry");
         return;
@@ -259,7 +278,12 @@ void Node::LeaderSubmitNoOpCommand() {
 // 发送心跳请求，也用于成为Leader后发起日志复制
 void Node::BroadcastHeartbeat() {
     for (auto& [peer_id, _] : _peers) {
-        ReplicateLog(peer_id);
+        if (_next_index[peer_id] <= _snapshot_last_index &&
+            _snapshoting_peers[peer_id] == false) {
+            SendSnapshot(peer_id);
+        } else {
+            ReplicateLog(peer_id);
+        }
     }
 
     _last_heartbeat_time = std::chrono::steady_clock::now();
@@ -278,11 +302,11 @@ void Node::ReplicateLog(int64_t peer_id) {
     int64_t next_idx = _next_index[peer_id];
     int64_t prev_log_index = next_idx - 1;
     int64_t prev_log_term = 0;    // 历史如果不存在日志, 则对应任期为0
-    int64_t last_stored_index = _store->GetLastLogIndex();
+    int64_t last_stored_index = GetLastLogIndex();
 
     if (prev_log_index > 0) {
         if (prev_log_index <= last_stored_index) {
-            prev_log_term = _store->LoadLogEntry(prev_log_index).term();
+            prev_log_term = GetLogTerm(prev_log_index);
         } else {
             _next_index[peer_id] = last_stored_index + 1;
             next_idx = _next_index[peer_id];
@@ -323,6 +347,10 @@ void Node::ApplyCommittedEntries() {
     while (_last_applied < _commit_index) {
         ++_last_applied;
 
+        if (_last_applied <= _snapshot_last_index) {
+            continue;
+        }
+
         auto entry = _store->LoadLogEntry(_last_applied);
 
         SPDLOG_INFO("Node {} applying log: term={}, index={}", _node_id,
@@ -331,15 +359,14 @@ void Node::ApplyCommittedEntries() {
 }
 
 // 检查请求方的日志是否更新
-bool Node::IsLogUpToDate(int64_t last_log_term, int64_t last_log_index) const {
-    int64_t last_stored_index = _store->GetLastLogIndex();
+bool Node::IsLogUpToDate(int64_t last_log_term, int64_t last_log_index) {
+    int64_t last_stored_index = GetLastLogIndex();
     if (last_stored_index == 0) {
         SPDLOG_INFO("Node {} has no logs stored", _node_id);
         return true;
     }
 
-    auto last_entry = _store->LoadLogEntry(last_stored_index);
-    int64_t last_stored_term = last_entry.term();
+    int64_t last_stored_term = GetLastLogTerm();
 
     SPDLOG_INFO("Node {} has last log entry: term={}, index={}", _node_id,
                 last_stored_term, last_stored_index);
@@ -371,6 +398,29 @@ void Node::SaveLogEntry(int64_t index) {
     }
 }
 
+int64_t Node::GetLastLogIndex() {
+    int64_t last_stored_index = _store->GetLastLogIndex();
+    if (last_stored_index == 0) {
+        return _snapshot_last_index;
+    }
+    return last_stored_index;
+}
+
+int64_t Node::GetLastLogTerm() { return GetLogTerm(GetLastLogIndex()); }
+
+int64_t Node::GetLogTerm(int64_t index) {
+    if (index <= _snapshot_last_index) {
+        return _snapshot_last_term;
+    }
+    return _store->LoadLogEntry(index).term();
+}
+
+void Node::DeleteLogEntriesBefore(int64_t index) {
+    if (!_store->DeleteLogEntriesBefore(index)) {
+        SPDLOG_ERROR("Failed to delete log entries before index {}", index);
+    }
+}
+
 // 删除从指定索引开始的日志条目
 void Node::DeleteLogEntriesFrom(int64_t from_index) {
     if (!_store->DeleteLogEntriesFrom(from_index)) {
@@ -383,8 +433,79 @@ void Node::LoadPersistentState() {
     _current_term = _store->LoadCurrentTerm();
     _voted_for = _store->LoadVotedFor();
 
-    SPDLOG_INFO("Loaded persistent state: term={}, voted_for={}", _current_term,
-                _voted_for);
+    auto meta = _store->LoadSnapshotMetaData();
+    _snapshot_last_index = meta.last_included_index();
+    _snapshot_last_term = meta.last_included_term();
+
+    // 因为快照的是已经应用到状态机的，所以可以用来初始化 last_applied 和
+    // commit_index
+    _last_applied = _commit_index = _snapshot_last_index;
+
+    SPDLOG_INFO(
+        "Loaded persistent state: term={}, voted_for={}, "
+        "snapshot_last_index={}, snapshot_last_term={}",
+        _current_term, _voted_for, _snapshot_last_index, _snapshot_last_term);
+}
+
+// 创建快照
+void Node::CreateSnapshot(int64_t last_included_index) {
+    auto last_entry = _store->LoadLogEntry(last_included_index);
+
+    raft::SnapshotMetaData meta;
+    meta.set_last_included_index(last_included_index);
+    meta.set_last_included_term(last_entry.term());
+    meta.set_data("Snapshot up to index " +
+                  std::to_string(last_included_index));    // 模拟
+
+    if (!_store->SaveSnapshotMetaData(meta)) {
+        SPDLOG_ERROR("Failed to save snapshot metadata");
+        return;
+    }
+
+    if (last_included_index > _snapshot_last_index) {
+        _snapshot_last_index = last_included_index;
+        _snapshot_last_term = last_entry.term();
+        DeleteLogEntriesBefore(last_included_index);
+    }
+
+    SPDLOG_INFO(
+        "Snapshot created: last_included_index={}, last_included_term={}",
+        last_included_index, last_entry.term());
+}
+
+void Node::SendSnapshot(int64_t peer_id) {
+    auto meta = _store->LoadSnapshotMetaData();
+
+    // 单分块快照安装请求
+    raft::InstallSnapshotRequest request;
+    request.set_term(_current_term);
+    request.set_leader_id(_node_id);
+    request.mutable_meta()->CopyFrom(meta);
+    request.set_offset(0);
+    request.set_done(true);
+
+    // brpc::Controller cntl;
+    // raft::InstallSnapshotResponse response;
+
+    // RaftService_Stub stub(_peers[peer_id].channel.get());
+    // stub.InstallSnapshot(&cntl, &request, &response, nullptr);
+    // if (cntl.Failed()) {
+    //     SPDLOG_ERROR("{}", cntl.ErrorText());
+    //     return;
+    // }
+
+    // HandleInstallSnapshotResponse(peer_id, request, response, cntl.Failed());
+
+    _snapshoting_peers[peer_id] = true;
+
+    AsyncInstallSnapshot(
+        peer_id, request,
+        [this, request](int64_t peer_id,
+                        const raft::InstallSnapshotResponse& response,
+                        bool failed) {
+            this->HandleInstallSnapshotResponse(peer_id, request, response,
+                                                failed);
+        });
 }
 
 // 异步发起投票请求
@@ -451,6 +572,38 @@ void Node::AsyncAppendEntries(int64_t peer_id,
     stub.AppendEntries(cntl, &request, response, done);
 }
 
+// 异步发起快照安装请求
+void Node::AsyncInstallSnapshot(int64_t peer_id,
+                                const raft::InstallSnapshotRequest& request,
+                                InstallSnapshotCallback callback) {
+    auto* cntl = new brpc::Controller();
+    auto* response = new raft::InstallSnapshotResponse();
+
+    struct InstallSnapshotCallbackWrapper {
+        Node* node;
+        brpc::Controller* cntl;
+        raft::InstallSnapshotResponse* response;
+        int64_t peer_id;
+        InstallSnapshotCallback callback;
+
+        static void Invoke(InstallSnapshotCallbackWrapper* arg) {
+            std::unique_ptr<InstallSnapshotCallbackWrapper> wrapper(arg);
+            wrapper->callback(wrapper->peer_id, *wrapper->response,
+                              wrapper->cntl->Failed());
+            delete wrapper->cntl;
+            delete wrapper->response;
+        }
+    };
+
+    auto* wrapper = new InstallSnapshotCallbackWrapper{this, cntl, response,
+                                                       peer_id, callback};
+    google::protobuf::Closure* done =
+        brpc::NewCallback(&InstallSnapshotCallbackWrapper::Invoke, wrapper);
+
+    RaftService_Stub stub(_peers[peer_id].channel.get());
+    stub.InstallSnapshot(cntl, &request, response, done);
+}
+
 // 请求投票异步回调处理
 void Node::HandleRequestVoteResponse(int64_t peer_id,
                                      const raft::RequestVoteRequest& request,
@@ -477,7 +630,6 @@ void Node::HandleRequestVoteResponse(int64_t peer_id,
 
         // 如果获得大多数服务器的投票：成为领导者
         if (_votes_received > static_cast<int64_t>(_peers_total_count / 2)) {
-            SPDLOG_INFO("Node {} became leader", _node_id);
             BecomeLeader();
         }
     }
@@ -515,16 +667,18 @@ void Node::HandleAppendEntriesResponse(
         _match_index[peer_id] = std::max(_match_index[peer_id], next_idx - 1);
     } else {    // 如果AppendEntries因为日志不一致而失败：递减NextIndex并重试
         if (_next_index[peer_id] > 1) {
+            SPDLOG_TRACE("AppendEntries retry");
             --_next_index[peer_id];
         }
     }
 
     // 如果存在一个N，使得N>commitIndex，大多数的matchIndex[i]≥N
     // 并且log[N].term == currentTerm：设置commitIndex = N
-    int64_t last_stored_index = _store->GetLastLogIndex();
+    int64_t last_stored_index = GetLastLogIndex();
     int64_t old_commit_index = _commit_index;
     for (int64_t i = _commit_index + 1; i <= last_stored_index; ++i) {
         auto entry = _store->LoadLogEntry(i);
+
         if (entry.term() != _current_term) continue;
 
         int64_t count = 1;
@@ -541,6 +695,37 @@ void Node::HandleAppendEntriesResponse(
         SPDLOG_INFO("Node {} updated commitIndex: {} -> {}", _node_id,
                     old_commit_index, _commit_index);
     }
+}
+
+// 快照安装回调处理
+void Node::HandleInstallSnapshotResponse(
+    int64_t peer_id, const raft::InstallSnapshotRequest& request,
+    const raft::InstallSnapshotResponse& response, bool failed) {
+    BAIDU_SCOPED_LOCK(_mutex);
+
+    _snapshoting_peers[peer_id] = false;
+
+    if (_state != State::LEADER) {
+        return;
+    }
+
+    if (failed) {
+        SPDLOG_TRACE("InstallSnapshot to peer {} failed", peer_id);
+        return;
+    }
+
+    if (response.term() > _current_term) {
+        StepDown(response.term());
+        return;
+    }
+
+    _next_index[peer_id] = std::max(_next_index[peer_id],
+                                    request.meta().last_included_index() + 1);
+    _match_index[peer_id] =
+        std::max(_match_index[peer_id], request.meta().last_included_index());
+
+    SPDLOG_INFO("update Node {} next_index:{}, match_index:{}", peer_id,
+                _next_index[peer_id], _match_index[peer_id]);
 }
 
 // 请求投票接收处理
@@ -603,28 +788,32 @@ void Node::AppendEntries(google::protobuf::RpcController* cntl_base,
         StepDown(request->term());
     }
 
+    int64_t last_stored_index = GetLastLogIndex();
+
     // 大于 0 说明是携带日志的
     if (request->prev_log_index() > 0) {
-        if (_store->GetLastLogIndex() < request->prev_log_index()) {
+        if (last_stored_index < request->prev_log_index()) {
             return;
         }
 
         // 如果对应索引有日志，检查对应 term 是否匹配
-        auto entry = _store->LoadLogEntry(request->prev_log_index());
-        if (entry.term() != request->prev_log_term()) {
+        int64_t log_term = GetLogTerm(request->prev_log_index());
+        if (log_term != request->prev_log_term()) {
+            SPDLOG_WARN(
+                "Log entry different in index {}, local term {}, remote term "
+                "{}",
+                request->prev_log_index(), log_term, request->prev_log_term());
             return;
         }
     }
 
     int64_t index = request->prev_log_index();
     for (const auto& new_entry : request->entries()) {
-        SPDLOG_INFO("new_entry: term={}, command={}", new_entry.term(),
-                    new_entry.command());
         ++index;
 
         // 如果一个现有的条目与一个新的条目相冲突（相同的索引但不同的任期）
         // 删除现有的条目和后面所有的条目
-        if (index <= _store->GetLastLogIndex()) {
+        if (index <= GetLastLogIndex()) {
             auto existing_entry = _store->LoadLogEntry(index);
             if (existing_entry.term() != new_entry.term()) {
                 DeleteLogEntriesFrom(index);
@@ -632,7 +821,7 @@ void Node::AppendEntries(google::protobuf::RpcController* cntl_base,
         }
 
         // 添加日志中任何尚未出现的新条目
-        if (index > _store->GetLastLogIndex()) {
+        if (index > GetLastLogIndex()) {
             if (!_store->SaveLogEntry(index, new_entry)) {
                 LOG(ERROR) << "Failed to save log entry at index " << index;
                 return;
@@ -643,13 +832,72 @@ void Node::AppendEntries(google::protobuf::RpcController* cntl_base,
     // 如果leaderCommit > commitIndex，设置commitIndex = min(leaderCommit,
     // 最后一个新条目的索引)
     if (request->leader_commit() > _commit_index) {
-        _commit_index =
-            std::min(request->leader_commit(), _store->GetLastLogIndex());
+        _commit_index = std::min(request->leader_commit(), GetLastLogIndex());
 
         ApplyCommittedEntries();
     }
 
     response->set_success(true);
+}
+
+void Node::InstallSnapshot(google::protobuf::RpcController* cntl_base,
+                           const raft::InstallSnapshotRequest* request,
+                           raft::InstallSnapshotResponse* response,
+                           google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+
+    BAIDU_SCOPED_LOCK(_mutex);
+
+    response->set_term(_current_term);
+
+    // 如果term < currentTerm就立即回复
+    if (request->term() < _current_term) {
+        return;
+    }
+
+    ResetElectionTimer();
+
+    if (_snapshot_last_index == request->meta().last_included_index() &&
+        _snapshot_last_term == request->meta().last_included_term()) {
+        return;
+    }
+
+    SPDLOG_INFO("Start to install snapshot");
+
+    if (request->offset() != 0 || request->done() != true) {
+        cntl_base->SetFailed("Not support chunk snapshot install");
+        return;
+    }
+
+    if (request->term() > _current_term) {
+        StepDown(request->term());
+    }
+
+    // 保存快照文件，丢弃具有较小索引的任何现有或部分快照
+    if (!_store->SaveSnapshotMetaData(request->meta())) {
+        cntl_base->SetFailed("Failed to save snapshot meta data");
+        return;
+    }
+
+    _snapshot_last_index = request->meta().last_included_index();
+    _snapshot_last_term = request->meta().last_included_term();
+    _commit_index = std::max(_commit_index, _snapshot_last_index);
+    _last_applied = std::max(_last_applied, _snapshot_last_index);
+
+    int64_t last_store_index = GetLastLogIndex();
+    int64_t last_store_term = GetLastLogTerm();
+
+    if (last_store_index == request->meta().last_included_index() &&
+        last_store_term == request->meta().last_included_term()) {
+        // 如果现存的日志条目与快照中最后包含的日志条目具有相同的索引值和任期号，则保留其后的日志条目
+        DeleteLogEntriesBefore(last_store_index);
+    } else {
+        // 丢弃整个日志
+        DeleteLogEntriesFrom(0);
+    }
+
+    // 使用快照重置状态机
+    SPDLOG_INFO("Snapshot apply data {}", request->meta().data());
 }
 
 bool Node::SubmitCommand(const std::string& command) {
@@ -663,7 +911,7 @@ bool Node::SubmitCommand(const std::string& command) {
     entry.set_term(_current_term);
     entry.set_command(command);
 
-    int64_t new_index = _store->GetLastLogIndex() + 1;
+    int64_t new_index = GetLastLogIndex() + 1;
     if (!_store->SaveLogEntry(new_index, entry)) {
         SPDLOG_ERROR("Failed to save log entry");
         return false;
