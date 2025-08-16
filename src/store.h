@@ -57,6 +57,8 @@ private:
     std::string _db_path;
     rocksdb::DB* _db;
     rocksdb::Options _options;
+    rocksdb::WriteOptions _write_options;
+    rocksdb::ReadOptions _read_options;
 };
 
 }    // namespace raft
