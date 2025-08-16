@@ -22,3 +22,7 @@
 #...
 ./RaftImpl --node_id=3
 ```
+
+## 参考
+
+* [raft论文中文翻译](https://github.com/maemual/raft-zh_cn/blob/master/raft-zh_cn.md)
