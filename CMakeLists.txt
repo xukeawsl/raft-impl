@@ -29,6 +29,10 @@ add_executable(${PROJECT_NAME} main.cpp ${PROTO_SRC_FILES} ${SRC_FILES})
 target_link_libraries(${PROJECT_NAME} brpc protobuf gflags pthread rocksdb spdlog::spdlog)
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gen ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+add_executable(counter_client client/counter_client.cpp ${PROTO_SRC_FILES})
+target_link_libraries(counter_client brpc protobuf gflags pthread)
+target_include_directories(counter_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gen ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 #
 # Clang-Format
 #

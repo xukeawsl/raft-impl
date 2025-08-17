@@ -17,14 +17,24 @@
 #include "bthread/mutex.h"
 #include "peer.h"
 #include "raft.pb.h"
+#include "state_machine.h"
 #include "store.h"
 #include "util.h"
 
 namespace raft {
 
+struct NodeOptions {
+    int64_t node_id;
+    std::string peers;
+    StateMachine* fsm;
+    bool node_owns_fsm;
+
+    NodeOptions() : fsm(nullptr), node_owns_fsm(false) {}
+};
+
 class Node : public RaftService {
 public:
-    Node(int64_t node_id, const std::vector<Peer>& peers);
+    Node();
 
     ~Node();
 
@@ -43,11 +53,13 @@ public:
                          raft::InstallSnapshotResponse* response,
                          google::protobuf::Closure* done) override;
 
+    bool Init(const NodeOptions& options);
+
     void Start();
 
     void Stop();
 
-    bool SubmitCommand(const std::string& command);
+    void Apply(Task task);
 
 private:
     enum class State { FOLLOWER, CANDIDATE, LEADER };
@@ -91,8 +103,6 @@ private:
 
     void SaveVotedFor();
 
-    void SaveLogEntry(int64_t index);
-
     int64_t GetLastLogIndex();
 
     int64_t GetLastLogTerm();
@@ -134,7 +144,11 @@ private:
         int64_t peer_id, const raft::InstallSnapshotRequest& request,
         const raft::InstallSnapshotResponse& response, bool failed);
 
-    const int64_t _node_id;
+    StateMachine* _fsm;
+    bool _node_owns_fsm;
+    std::map<int64_t, Task> _tasks;
+
+    int64_t _node_id;
     std::string _self_address;
     State _state;
     int64_t _current_term;

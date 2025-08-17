@@ -18,12 +18,13 @@ DEFINE_int64(election_timeout_max, 300,
 DEFINE_int64(heartbeat_interval_ms, 50, "Heartbeat interval in milliseconds");
 DEFINE_int64(snapshot_check_interval_ms, 5000,
              "Snapshot check interval in milliseconds");
-DEFINE_int64(snapshot_interval, 5, "Log entries between snapshots");
+DEFINE_int64(snapshot_interval, 1000, "Log entries between snapshots");
 
 namespace raft {
 
-Node::Node(int64_t node_id, const std::vector<Peer>& peers)
-    : _node_id(node_id),
+Node::Node()
+    : _fsm(nullptr),
+      _node_owns_fsm(false),
       _state(State::FOLLOWER),
       _current_term(0),
       _voted_for(-1),
@@ -31,9 +32,44 @@ Node::Node(int64_t node_id, const std::vector<Peer>& peers)
       _last_applied(0),
       _last_heartbeat_time(std::chrono::steady_clock::now()),
       _rng(std::random_device{}()),
-      _last_snapshot_time(std::chrono::steady_clock::now()) {
+      _last_snapshot_time(std::chrono::steady_clock::now()) {}
+
+Node::~Node() {}
+
+bool Node::Init(const NodeOptions& options) {
+    std::vector<raft::Peer> peers;
+    std::istringstream iss(options.peers);
+    std::string token;
+
+    while (std::getline(iss, token, ',')) {
+        if (!token.empty()) {
+            raft::Peer peer(token);
+            if (!peer.is_empty()) {
+                peers.push_back(peer);
+            }
+        }
+    }
+
+    bool found = false;
     for (const auto& peer : peers) {
-        if (peer.id == node_id) {
+        if (peer.id == options.node_id) {
+            found = true;
+            break;
+        }
+    }
+
+    if (!found) {
+        SPDLOG_ERROR("Current node ID {} not found in peer list",
+                     options.node_id);
+        return false;
+    }
+
+    _fsm = options.fsm;
+    _node_owns_fsm = options.node_owns_fsm;
+    _node_id = options.node_id;
+
+    for (const auto& peer : peers) {
+        if (peer.id == _node_id) {
             _self_address = peer.address();
             continue;
         }
@@ -44,19 +80,20 @@ Node::Node(int64_t node_id, const std::vector<Peer>& peers)
     _peers_total_count = _peers.size() + 1;
 
     if (_self_address.empty()) {
-        SPDLOG_ERROR("Current node ID {} not found in peers", node_id);
-        throw std::runtime_error("Invalid node configuration");
+        SPDLOG_ERROR("Current node ID {} not found in peers", _node_id);
+        return false;
     }
 
-    std::string db_path = "./raft_meta/node_" + std::to_string(node_id);
+    std::string db_path = "./raft_meta/node_" + std::to_string(_node_id);
     if (!butil::CreateDirectory(butil::FilePath(db_path))) {
-        throw std::runtime_error("Failed to create database directory: " +
-                                 db_path);
+        SPDLOG_ERROR("Failed to create database directory:{}", db_path);
+        return false;
     }
 
     _store = std::make_unique<Store>(db_path);
     if (!_store->Open()) {
-        throw std::runtime_error("Failed to open RocksDB storage");
+        SPDLOG_ERROR("Failed to open RocksDB storage");
+        return false;
     }
 
     LoadPersistentState();
@@ -64,15 +101,16 @@ Node::Node(int64_t node_id, const std::vector<Peer>& peers)
     for (auto& [peer_id, peer] : _peers) {
         SPDLOG_INFO("Added peer: {}", _peers[peer.id].to_string());
         if (!peer.init_channel()) {
-            throw std::runtime_error("Failed to initialize channel for peer: " +
-                                     peer.address());
+            SPDLOG_ERROR("Failed to initialize channel for peer:{}",
+                         peer.address());
+            return false;
         }
     }
 
     ResetElectionTimer();
-}
 
-Node::~Node() { Stop(); }
+    return true;
+}
 
 void Node::Start() {
     if (_server.AddService(this, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
@@ -96,6 +134,17 @@ void Node::Stop() {
     if (_run_thread.joinable()) {
         _run_thread.join();
     }
+
+    BAIDU_SCOPED_LOCK(_mutex);
+    SPDLOG_INFO("tasks map size: {}", _tasks.size());
+    for (auto& [index, task] : _tasks) {
+        if (task.done) {
+            SPDLOG_INFO("done Run {}", index);
+            task.done->Run();
+        }
+    }
+    _tasks.clear();
+
     _server.Stop(0);
     _server.Join();
 }
@@ -241,9 +290,8 @@ void Node::BecomeLeader() {
 
     // 默认要同步的下一个条目的索引为最后一条目录索引+1
     // 已知的已经匹配的索引应该为0
-    int64_t last_log_index = GetLastLogIndex();
     for (const auto& [peer_id, _] : _peers) {
-        _next_index[peer_id] = last_log_index + 1;
+        _next_index[peer_id] = GetLastLogIndex() + 1;
         _match_index[peer_id] = 0;
     }
 
@@ -256,7 +304,8 @@ void Node::BecomeLeader() {
 // 所以需要保证状态机执行时幂等的，有两种方案
 // 1. raft 协议实现保证幂等，通过添加请求 ID 来实现，执行过的直接跳过
 // 2. 状态机内部实现幂等性，也可以采用类似的方法
-// 最后为了加快恢复速度，可以引入快照来压缩日志
+// 最后为了加快恢复速度，可以引入快照来压缩日志（这样再初始化时 last_applied
+// 可以更新到快照索引
 void Node::LeaderSubmitNoOpCommand() {
     LogEntry entry;
     entry.set_term(_current_term);
@@ -311,6 +360,10 @@ void Node::ReplicateLog(int64_t peer_id) {
             _next_index[peer_id] = last_stored_index + 1;
             next_idx = _next_index[peer_id];
             prev_log_index = next_idx - 1;
+
+            if (prev_log_index > 0 && prev_log_index <= _snapshot_last_index) {
+                prev_log_term = _snapshot_last_term;
+            }
         }
     }
 
@@ -325,7 +378,12 @@ void Node::ReplicateLog(int64_t peer_id) {
 
     if (next_idx <= last_stored_index) {
         for (int64_t i = next_idx; i <= last_stored_index; ++i) {
-            request.add_entries()->CopyFrom(_store->LoadLogEntry(i));
+            if (i <= _snapshot_last_index) continue;
+            auto entry = _store->LoadLogEntry(i);
+            if (!entry.has_term()) {
+                SPDLOG_ERROR("no log entry in {}", i);
+            }
+            request.add_entries()->CopyFrom(entry);
         }
     }
 
@@ -351,10 +409,11 @@ void Node::ApplyCommittedEntries() {
             continue;
         }
 
-        auto entry = _store->LoadLogEntry(_last_applied);
-
-        SPDLOG_INFO("Node {} applying log: term={}, index={}", _node_id,
-                    entry.term(), _last_applied);
+        auto it = _tasks.find(_last_applied);
+        if (it != _tasks.end()) {
+            _fsm->on_apply(it->second);
+            _tasks.erase(it);
+        }
     }
 }
 
@@ -390,17 +449,9 @@ void Node::SaveVotedFor() {
     }
 }
 
-// 持久化日志条目
-void Node::SaveLogEntry(int64_t index) {
-    auto entry = _store->LoadLogEntry(index);
-    if (!_store->SaveLogEntry(index, entry)) {
-        SPDLOG_ERROR("Failed to save log entry");
-    }
-}
-
 int64_t Node::GetLastLogIndex() {
     int64_t last_stored_index = _store->GetLastLogIndex();
-    if (last_stored_index == 0) {
+    if (last_stored_index <= _snapshot_last_index) {
         return _snapshot_last_index;
     }
     return last_stored_index;
@@ -449,13 +500,30 @@ void Node::LoadPersistentState() {
 
 // 创建快照
 void Node::CreateSnapshot(int64_t last_included_index) {
+    // 检查索引是否有效（必须在快照之后且不超过当前日志最大索引）
+    int64_t last_log_index = GetLastLogIndex();
+    if (last_included_index <= _snapshot_last_index ||
+        last_included_index > last_log_index) {
+        SPDLOG_WARN(
+            "Invalid snapshot index: {}, current snapshot index: {}, last log "
+            "index: {}",
+            last_included_index, _snapshot_last_index, last_log_index);
+        return;
+    }
+
     auto last_entry = _store->LoadLogEntry(last_included_index);
+    if (last_entry.term() == 0) {
+        SPDLOG_ERROR("Log entry at index {} not found", last_included_index);
+        return;
+    }
 
     raft::SnapshotMetaData meta;
     meta.set_last_included_index(last_included_index);
     meta.set_last_included_term(last_entry.term());
-    meta.set_data("Snapshot up to index " +
-                  std::to_string(last_included_index));    // 模拟
+
+    std::string snapshot_data;
+    _fsm->on_snapshot_save(snapshot_data);
+    meta.set_data(snapshot_data);
 
     if (!_store->SaveSnapshotMetaData(meta)) {
         SPDLOG_ERROR("Failed to save snapshot metadata");
@@ -483,18 +551,6 @@ void Node::SendSnapshot(int64_t peer_id) {
     request.mutable_meta()->CopyFrom(meta);
     request.set_offset(0);
     request.set_done(true);
-
-    // brpc::Controller cntl;
-    // raft::InstallSnapshotResponse response;
-
-    // RaftService_Stub stub(_peers[peer_id].channel.get());
-    // stub.InstallSnapshot(&cntl, &request, &response, nullptr);
-    // if (cntl.Failed()) {
-    //     SPDLOG_ERROR("{}", cntl.ErrorText());
-    //     return;
-    // }
-
-    // HandleInstallSnapshotResponse(peer_id, request, response, cntl.Failed());
 
     _snapshoting_peers[peer_id] = true;
 
@@ -692,8 +748,8 @@ void Node::HandleAppendEntriesResponse(
     }
 
     if (old_commit_index != _commit_index) {
-        SPDLOG_INFO("Node {} updated commitIndex: {} -> {}", _node_id,
-                    old_commit_index, _commit_index);
+        SPDLOG_TRACE("Node {} updated commitIndex: {} -> {}", _node_id,
+                     old_commit_index, _commit_index);
     }
 }
 
@@ -784,15 +840,13 @@ void Node::AppendEntries(google::protobuf::RpcController* cntl_base,
 
     ResetElectionTimer();
 
-    if (request->term() > _current_term || _state != State::FOLLOWER) {
+    if (request->term() > _current_term) {
         StepDown(request->term());
     }
 
-    int64_t last_stored_index = GetLastLogIndex();
-
     // 大于 0 说明是携带日志的
     if (request->prev_log_index() > 0) {
-        if (last_stored_index < request->prev_log_index()) {
+        if (GetLastLogIndex() < request->prev_log_index()) {
             return;
         }
 
@@ -813,9 +867,11 @@ void Node::AppendEntries(google::protobuf::RpcController* cntl_base,
 
         // 如果一个现有的条目与一个新的条目相冲突（相同的索引但不同的任期）
         // 删除现有的条目和后面所有的条目
-        if (index <= GetLastLogIndex()) {
+        if (index > _snapshot_last_index && index <= GetLastLogIndex()) {
             auto existing_entry = _store->LoadLogEntry(index);
-            if (existing_entry.term() != new_entry.term()) {
+            if (!existing_entry.has_term()) {
+                SPDLOG_ERROR("Fail to load existing entry");
+            } else if (existing_entry.term() != new_entry.term()) {
                 DeleteLogEntriesFrom(index);
             }
         }
@@ -825,6 +881,12 @@ void Node::AppendEntries(google::protobuf::RpcController* cntl_base,
             if (!_store->SaveLogEntry(index, new_entry)) {
                 LOG(ERROR) << "Failed to save log entry at index " << index;
                 return;
+            }
+
+            if (new_entry.has_command()) {
+                raft::Task task;
+                task.data = new_entry.command();
+                _tasks[index] = task;
             }
         }
     }
@@ -887,8 +949,8 @@ void Node::InstallSnapshot(google::protobuf::RpcController* cntl_base,
     int64_t last_store_index = GetLastLogIndex();
     int64_t last_store_term = GetLastLogTerm();
 
-    if (last_store_index == request->meta().last_included_index() &&
-        last_store_term == request->meta().last_included_term()) {
+    if (last_store_index == _snapshot_last_index &&
+        last_store_term == _snapshot_last_term) {
         // 如果现存的日志条目与快照中最后包含的日志条目具有相同的索引值和任期号，则保留其后的日志条目
         DeleteLogEntriesBefore(last_store_index);
     } else {
@@ -897,25 +959,28 @@ void Node::InstallSnapshot(google::protobuf::RpcController* cntl_base,
     }
 
     // 使用快照重置状态机
-    SPDLOG_INFO("Snapshot apply data {}", request->meta().data());
+    _fsm->on_snapshot_load(request->meta().data());
 }
 
-bool Node::SubmitCommand(const std::string& command) {
+void Node::Apply(Task task) {
     BAIDU_SCOPED_LOCK(_mutex);
 
     if (_state != State::LEADER) {
-        return false;
+        // 重定向到 Leader
+        return;
     }
 
     LogEntry entry;
     entry.set_term(_current_term);
-    entry.set_command(command);
+    entry.set_command(task.data);
 
     int64_t new_index = GetLastLogIndex() + 1;
     if (!_store->SaveLogEntry(new_index, entry)) {
         SPDLOG_ERROR("Failed to save log entry");
-        return false;
+        return;
     }
+
+    _tasks[new_index] = task;
 
     for (auto& [peer_id, _] : _peers) {
         if (_next_index[peer_id] == new_index) {
@@ -923,8 +988,6 @@ bool Node::SubmitCommand(const std::string& command) {
         }
         ReplicateLog(peer_id);
     }
-
-    return true;
 }
 
 }    // namespace raft

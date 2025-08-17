@@ -12,9 +12,8 @@ Store::Store(const std::string& db_path) : _db_path(db_path), _db(nullptr) {
     _options.max_log_file_size = 100 * 1024 * 1024;    // 100MB
     _options.max_background_jobs = 4;
 
-    _write_options.sync = true;    // 写入时同步刷盘
-    _read_options.verify_checksums =
-        true;    // 读取时验证一致性，确保数据没有损坏
+    _write_options.sync = true;               // 写入时同步刷盘
+    _read_options.verify_checksums = true;    // 读取时验证一致性
 }
 
 Store::~Store() {

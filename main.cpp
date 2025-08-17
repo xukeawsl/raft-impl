@@ -1,26 +1,11 @@
 #include <iostream>
 
 #include "node.h"
+#include "service/counter_service.h"
 
+DEFINE_int64(service_port, 8054, "Service Port");
 DEFINE_int64(node_id, 0, "Raft node ID");
 DEFINE_string(peers, "", "Comma-separated peer addresses in format ip:port:id");
-
-std::vector<raft::Peer> parse_peers(const std::string& peers_str) {
-    std::vector<raft::Peer> peers;
-    std::istringstream iss(peers_str);
-    std::string token;
-
-    while (std::getline(iss, token, ',')) {
-        if (!token.empty()) {
-            raft::Peer peer(token);
-            if (!peer.is_empty()) {
-                peers.push_back(peer);
-            }
-        }
-    }
-
-    return peers;
-}
 
 int main(int argc, char* argv[]) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
@@ -33,43 +18,34 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    std::vector<raft::Peer> peers = parse_peers(FLAGS_peers);
+    brpc::Server server;
 
-    bool found = false;
-    for (const auto& peer : peers) {
-        if (peer.id == FLAGS_node_id) {
-            found = true;
-            break;
-        }
-    }
+    example::Counter counter;
+    example::CounterServiceImpl service(&counter);
 
-    if (!found) {
-        SPDLOG_ERROR("Current node ID {} not found in peer list",
-                     FLAGS_node_id);
+    if (server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE)) {
+        SPDLOG_ERROR("Fail to add service");
         return EXIT_FAILURE;
     }
 
-    raft::Node node(FLAGS_node_id, peers);
-    node.Start();
-
-    std::string cmd;
-
-    while (true) {
-        std::cout << "> ";
-        std::getline(std::cin, cmd);
-
-        if (cmd == "exit" || cmd == "quit") {
-            break;
-        }
-
-        if (!node.SubmitCommand(cmd)) {
-            SPDLOG_WARN("Not leader, command not submitted");
-        } else {
-            SPDLOG_INFO("Command submitted: {}", cmd);
-        }
+    if (server.Start(FLAGS_service_port, nullptr)) {
+        SPDLOG_ERROR("Fail to start server");
+        return EXIT_FAILURE;
     }
 
-    node.Stop();
+    if (!counter.start(FLAGS_node_id, FLAGS_peers)) {
+        return EXIT_FAILURE;
+    }
+
+    while (!brpc::IsAskedToQuit()) {
+        sleep(1);
+    }
+
+    counter.stop();
+    server.Stop(0);
+    server.Join();
+
+    SPDLOG_INFO("Stop raft service");
 
     raft::util::flush_spdlog();
 

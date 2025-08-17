@@ -1,9 +1,9 @@
 # raft-impl
 
-基于 brpc 和 rocksdb 实现 raft 共识算法，实现如下功能
+基于 brpc 和 rocksdb 实现 raft 共识算法，主要是专注于功能实现，性能并不佳，工程上推荐使用 braft，实现如下功能
 * 领导者选举
 * 日志复制
-* 快照安装（不支持多分块）
+* 快照安装（不支持分块）
 
 ## 依赖
 
@@ -17,10 +17,18 @@
 
 * 修改 `gflags.conf` 配置即可，目前配的三个节点，运行时带上节点 ID 即可
 
+* 计数服务的监听端口端口可以运行时通过 `service_port` 指定
+
 ```bash
-./RaftImpl --node_id=1
+./RaftImpl --node_id=1 --service_port=9054
 #...
-./RaftImpl --node_id=3
+./RaftImpl --node_id=3 --service_port=9056
+```
+
+* 运行客户端程序，需要指定 Leader 节点的地址，目前还不支持重定向请求
+
+```bash
+./counter_client --server_addr=127.0.0.1:9054
 ```
 
 ## 参考

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "brpc/server.h"
 #include "gflags/gflags.h"
 #include "spdlog/async.h"
 #include "spdlog/sinks/basic_file_sink.h"
@@ -8,6 +9,15 @@
 #include "spdlog/spdlog.h"
 
 namespace raft {
+
+struct Task {
+    std::string data;
+    const ::google::protobuf::Message* request;
+    ::google::protobuf::Message* response;
+    ::google::protobuf::Closure* done;
+
+    Task() : request(nullptr), response(nullptr), done(nullptr) {}
+};
 
 namespace util {
 
